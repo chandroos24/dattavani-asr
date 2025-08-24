@@ -1,0 +1,76 @@
+# Dattavani ASR Configuration Template
+# Copy this file to dattavani-asr.toml and customize as needed
+
+[google]
+# Google Cloud project ID (optional if using ADC)
+project_id = "your-project-id"
+
+# Google Drive API version
+drive_api_version = "v3"
+
+# Google Cloud Storage API version  
+storage_api_version = "v1"
+
+[whisper]
+# Whisper model size: tiny, base, small, medium, large, large-v2, large-v3
+model_size = "large-v3"
+
+# Device for inference: auto, cpu, cuda, metal
+device = "auto"
+
+# Compute type: float16, float32, int8
+compute_type = "float16"
+
+# Default language (optional, auto-detect if not specified)
+# language = "en"
+
+# Task type: transcribe, translate
+task = "transcribe"
+
+[processing]
+# Maximum number of concurrent workers
+max_workers = 4
+
+# Temporary directory for processing
+temp_dir = "/tmp/dattavani_asr"
+
+# Segment duration for large files (seconds)
+segment_duration = 300
+
+# Target sample rate for audio processing
+target_sample_rate = 16000
+
+# Chunk size for streaming (bytes)
+chunk_size = 8192
+
+# Timeout for operations (seconds)
+timeout_seconds = 3600
+
+# Number of retry attempts for failed operations
+retry_attempts = 3
+
+[logging]
+# Log level: debug, info, warn, error
+level = "info"
+
+# Log file path
+file = "dattavani_asr.log"
+
+# Maximum log file size (bytes)
+max_file_size = 10485760  # 10MB
+
+# Maximum number of log files to keep
+max_files = 7
+
+[storage]
+# Default output bucket for GCS (optional)
+# output_bucket = "your-output-bucket"
+
+# Output prefix/folder name
+output_prefix = "gen-transcript"
+
+# Cache directory
+cache_dir = "/tmp/dattavani_cache"
+
+# Maximum cache size (bytes)
+max_cache_size = 1073741824  # 1GB

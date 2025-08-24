@@ -1,0 +1,102 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+qa-agent/reports/*.json
+qa-agent/reports/*.html
+
+# Environment
+.env
+.env.local
+.env.production
+.env.test
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+temp/
+
+# Audio/Video files (for testing)
+*.mp3
+*.wav
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.flv
+*.m4a
+*.aac
+*.ogg
+*.wma
+*.part
+
+# Configuration files with secrets
+service-account-key.json
+*-key.json
+*.pem
+*.p12
+
+# Build artifacts
+dist/
+build/
+*.deb
+*.rpm
+*.dmg
+*.exe
+
+# Test artifacts
+test-results/
+coverage/
+*.profraw
+
+# Documentation build
+docs/_build/
+site/
+
+# Python (for QA agent)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Node.js (if any)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Generated files
+dattavani-asr.toml
+qa-report-*.json
+qa-dashboard.*
+security-*.json
+performance-*.json
+*.svg

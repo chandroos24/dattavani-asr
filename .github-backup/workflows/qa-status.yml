@@ -1,0 +1,147 @@
+name: QA Status Check
+
+on:
+  schedule:
+    # Run QA checks every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    # Allow manual triggering
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  qa-status:
+    name: QA Status Monitor
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg python3-pip
+        pip3 install psutil requests toml
+
+    - name: Build release binary
+      run: cargo build --release
+
+    - name: Run QA Agent
+      run: |
+        python3 qa-agent/qa_agent.py --project-root . --format json --output qa-status.json
+
+    - name: Generate QA Dashboard
+      run: |
+        python3 qa-agent/qa_dashboard.py --export json --output qa-metrics.json
+        python3 qa-agent/qa_dashboard.py > qa-dashboard.txt
+
+    - name: Run Security Check
+      run: |
+        python3 qa-agent/scripts/security_check.py . > security-status.json
+
+    - name: Run Performance Benchmark
+      run: |
+        python3 qa-agent/scripts/performance_benchmark.py . > performance-status.json
+
+    - name: Generate Status Badge
+      run: |
+        python3 qa-agent/scripts/generate_qa_badge.py qa-agent/reports/ > qa-badge.svg
+
+    - name: Update README with QA Status
+      run: |
+        # Update README with latest QA status (if needed)
+        echo "QA Status updated at $(date)" >> qa-status-log.txt
+
+    - name: Upload QA Artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: qa-status-artifacts
+        path: |
+          qa-status.json
+          qa-metrics.json
+          qa-dashboard.txt
+          security-status.json
+          performance-status.json
+          qa-badge.svg
+          qa-status-log.txt
+
+    - name: Create QA Status Issue (on failure)
+      if: failure()
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          
+          let qaStatus = "QA Status check failed";
+          try {
+            const dashboard = fs.readFileSync('qa-dashboard.txt', 'utf8');
+            qaStatus = dashboard;
+          } catch (e) {
+            qaStatus = "Could not read QA dashboard";
+          }
+          
+          github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: '🚨 QA Status Check Failed',
+            body: `## QA Status Check Failed
+            
+**Time**: ${new Date().toISOString()}
+**Workflow**: ${context.workflow}
+**Run ID**: ${context.runId}
+
+### QA Dashboard Output:
+\`\`\`
+${qaStatus}
+\`\`\`
+
+Please investigate the QA failures and fix any issues.`,
+            labels: ['qa', 'automated', 'bug']
+          });
+
+  notify-status:
+    name: Notify QA Status
+    runs-on: ubuntu-latest
+    needs: qa-status
+    if: always()
+    
+    steps:
+    - name: Download QA artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: qa-status-artifacts
+
+    - name: Set QA Status
+      id: qa-status
+      run: |
+        if [ -f qa-status.json ]; then
+          STATUS=$(python3 -c "import json; data=json.load(open('qa-status.json')); print(data.get('summary', {}).get('overall_status', 'UNKNOWN'))")
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+        else
+          echo "status=ERROR" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Update commit status
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const status = '${{ steps.qa-status.outputs.status }}';
+          const state = status === 'PASS' ? 'success' : 
+                       status === 'PASS_WITH_WARNINGS' ? 'success' : 'failure';
+          
+          github.rest.repos.createCommitStatus({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            sha: context.sha,
+            state: state,
+            target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            description: `QA Status: ${status}`,
+            context: 'qa-agent/status'
+          });

@@ -1,0 +1,89 @@
+[package]
+name = "dattavani-asr"
+version = "1.0.0"
+edition = "2021"
+authors = ["Veteran AI/ML Engineer <your-email@example.com>"]
+description = "High-performance Automatic Speech Recognition processor with Google Drive integration"
+license = "MIT"
+repository = "https://github.com/your-username/dattavani-asr-rust"
+keywords = ["asr", "speech-recognition", "whisper", "google-drive", "audio"]
+categories = ["multimedia::audio", "api-bindings", "command-line-utilities"]
+
+[dependencies]
+# Core async runtime
+tokio = { version = "1.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+# HTTP client and streaming
+reqwest = { version = "0.11", features = ["json", "stream", "multipart"] }
+bytes = "1.0"
+
+# CLI framework
+clap = { version = "4.0", features = ["derive", "env"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.7"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Async utilities
+futures = "0.3"
+futures-util = "0.3"
+
+# File system and path utilities
+tempfile = "3.0"
+walkdir = "2.0"
+
+# Progress bars and UI
+indicatif = "0.17"
+
+# Configuration
+dotenv = "0.15"
+
+# URL parsing
+url = "2.0"
+regex = "1.0"
+
+# Time utilities
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID generation
+uuid = { version = "1.0", features = ["v4"] }
+
+# URL encoding
+urlencoding = "2.1"
+
+[dev-dependencies]
+tempfile = "3.0"
+tokio-test = "0.4"
+
+[[bin]]
+name = "dattavani-asr"
+path = "src/main.rs"
+
+[lib]
+name = "dattavani_asr"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[features]
+default = []
+cpu-only = []

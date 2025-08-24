@@ -1,0 +1,67 @@
+# QA Agent Configuration for Dattavani ASR Rust Port
+
+[general]
+project_name = "Dattavani ASR Rust Port"
+version = "1.0.0"
+timeout_default = 30
+max_retries = 3
+
+[thresholds]
+# Performance thresholds
+startup_time_excellent = 1.0    # seconds
+startup_time_good = 3.0         # seconds
+memory_usage_excellent = 100    # MB
+memory_usage_good = 500         # MB
+
+# Quality thresholds
+max_clippy_warnings = 10
+max_clippy_errors = 0
+min_pass_rate = 0.8            # 80% minimum pass rate
+
+[test_categories]
+# Test categories and their priorities
+build = { priority = 1, required = true }
+cli = { priority = 2, required = true }
+performance = { priority = 3, required = false }
+quality = { priority = 4, required = false }
+
+[reporting]
+# Report generation settings
+default_format = "json"
+include_details = true
+max_log_length = 1000
+generate_html = true
+generate_summary = true
+
+[binary]
+# Binary-specific settings
+expected_name = "dattavani-asr"
+expected_path = "target/release/dattavani-asr"
+min_size_mb = 1.0
+max_size_mb = 50.0
+
+[commands]
+# Expected CLI commands and their validation
+help = { args = ["--help"], expect_exit_code = 0, expect_content = ["Commands:", "stream-process"] }
+version = { args = ["--version"], expect_exit_code = 0, expect_content = ["dattavani-asr"] }
+supported_formats = { args = ["supported-formats"], expect_exit_code = 0, expect_content = ["mp4", "mp3"] }
+generate_config = { args = ["generate-config", "--output", "/tmp/test.toml"], expect_exit_code = 0, cleanup = ["/tmp/test.toml"] }
+
+[performance_tests]
+# Performance test configurations
+startup_runs = 5
+memory_sampling_interval = 0.1  # seconds
+load_test_duration = 10         # seconds
+
+[quality_checks]
+# Code quality checks
+run_clippy = true
+run_fmt_check = true
+run_audit = false  # Requires cargo-audit
+check_dependencies = true
+
+[notifications]
+# Notification settings (for CI/CD integration)
+slack_webhook = ""
+email_recipients = []
+github_status_check = false
