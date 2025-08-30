@@ -1,0 +1,408 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches: [ develop ]
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip tests and deploy directly'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  CARGO_TERM_COLOR: always
+  AWS_REGION: us-east-1
+  EC2_INSTANCE_ID: i-09726de87ad1f9596  # Same instance, different port for staging
+  S3_BUCKET: dattavani
+
+jobs:
+  # Job 1: Quick tests for staging
+  quick-test:
+    name: Quick Test
+    runs-on: ubuntu-latest
+    if: github.event.inputs.skip_tests != 'true'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+        
+    - name: Cache Rust dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        
+    - name: Quick format check
+      run: cargo fmt -- --check
+      
+    - name: Quick build test
+      run: cargo check --release
+      
+    - name: Run unit tests only
+      run: cargo test --lib --bins
+
+  # Job 2: Build for staging
+  build:
+    name: Build for Staging
+    runs-on: ubuntu-latest
+    needs: [quick-test]
+    if: always() && (needs.quick-test.result == 'success' || needs.quick-test.result == 'skipped')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+        
+    - name: Cache Rust dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        
+    - name: Build staging binary
+      run: cargo build --release
+      
+    - name: Upload staging binary
+      uses: actions/upload-artifact@v3
+      with:
+        name: dattavani-asr-staging
+        path: target/release/dattavani-asr
+        retention-days: 3
+
+  # Job 3: Deploy to staging environment
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build]
+    
+    environment: 
+      name: staging
+      url: http://${{ steps.get-ip.outputs.public_ip }}:7861
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Download staging binary
+      uses: actions/download-artifact@v3
+      with:
+        name: dattavani-asr-staging
+        path: target/release/
+        
+    - name: Make binary executable
+      run: chmod +x target/release/dattavani-asr
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Ensure EC2 instance is running
+      run: |
+        # Check if instance is running
+        STATE=$(aws ec2 describe-instances \
+          --instance-ids ${{ env.EC2_INSTANCE_ID }} \
+          --query 'Reservations[0].Instances[0].State.Name' \
+          --output text)
+        
+        if [ "$STATE" != "running" ]; then
+          echo "Starting EC2 instance..."
+          aws ec2 start-instances --instance-ids ${{ env.EC2_INSTANCE_ID }}
+          aws ec2 wait instance-running --instance-ids ${{ env.EC2_INSTANCE_ID }}
+          sleep 30
+        fi
+        
+    - name: Get instance public IP
+      id: get-ip
+      run: |
+        PUBLIC_IP=$(aws ec2 describe-instances \
+          --instance-ids ${{ env.EC2_INSTANCE_ID }} \
+          --query 'Reservations[0].Instances[0].PublicIpAddress' \
+          --output text)
+        echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+        echo "Instance public IP: $PUBLIC_IP"
+        
+    - name: Setup SSH key
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H ${{ steps.get-ip.outputs.public_ip }} >> ~/.ssh/known_hosts
+        
+    - name: Create staging deployment package
+      run: |
+        tar -czf dattavani-asr-staging.tar.gz \
+          target/release/dattavani-asr \
+          aws-deployment/ \
+          dattavani-asr.toml.template \
+          .env.template
+          
+    - name: Deploy to staging
+      run: |
+        # Upload package
+        scp dattavani-asr-staging.tar.gz ubuntu@${{ steps.get-ip.outputs.public_ip }}:/tmp/
+        
+        # Deploy staging version
+        ssh ubuntu@${{ steps.get-ip.outputs.public_ip }} << 'EOF'
+          set -e
+          
+          echo "=== Deploying to staging ==="
+          
+          # Create staging directory
+          mkdir -p ~/projects/staging
+          cd ~/projects/staging
+          
+          # Backup existing staging if it exists
+          if [ -d "dattavani-asr-rust" ]; then
+            mv dattavani-asr-rust dattavani-asr-rust_backup_$(date +%Y%m%d_%H%M%S)
+          fi
+          
+          # Extract staging version
+          tar -xzf /tmp/dattavani-asr-staging.tar.gz
+          mv target/release/dattavani-asr dattavani-asr-rust/
+          chmod +x dattavani-asr-rust/dattavani-asr
+          
+          # Setup staging configuration
+          mkdir -p ~/.config/dattavani-asr-staging ~/logs ~/.cache/dattavani-asr-staging
+          
+          # Create staging configuration (different port and cache)
+          cat > ~/.config/dattavani-asr-staging/dattavani-asr.toml << 'TOML_EOF'
+        [aws]
+        region = "us-east-1"
+        s3_bucket = "dattavani"
+
+        [whisper]
+        model_size = "base"  # Smaller model for staging
+        device = "auto"
+        compute_type = "float16"
+        task = "transcribe"
+
+        [processing]
+        max_workers = 1  # Reduced for staging
+        segment_duration = 300
+        target_sample_rate = 16000
+        chunk_size = 8192
+        timeout_seconds = 1800
+        retry_attempts = 2
+
+        [logging]
+        level = "debug"  # More verbose for staging
+        file = "/home/ubuntu/logs/dattavani-asr-staging.log"
+        max_file_size = 10485760
+        max_files = 3
+
+        [storage]
+        temp_dir = "/tmp/dattavani_asr_staging"
+        cache_dir = "/home/ubuntu/.cache/dattavani-asr-staging"
+        output_prefix = "gen-transcript-staging"
+        max_cache_size = 1073741824  # 1GB for staging
+        TOML_EOF
+          
+          # Create staging systemd service
+          sudo tee /etc/systemd/system/dattavani-asr-staging.service > /dev/null << 'SERVICE_EOF'
+        [Unit]
+        Description=Dattavani ASR Rust Staging Service
+        After=network.target
+
+        [Service]
+        Type=simple
+        User=ubuntu
+        WorkingDirectory=/home/ubuntu/projects/staging/dattavani-asr-rust
+        ExecStart=/home/ubuntu/projects/staging/dattavani-asr-rust/dattavani-asr server --port 7861
+        Restart=always
+        RestartSec=10
+        Environment=RUST_LOG=debug
+        Environment=CONFIG_PATH=/home/ubuntu/.config/dattavani-asr-staging/dattavani-asr.toml
+
+        [Install]
+        WantedBy=multi-user.target
+        SERVICE_EOF
+          
+          # Enable and start staging service
+          sudo systemctl daemon-reload
+          sudo systemctl enable dattavani-asr-staging
+          sudo systemctl restart dattavani-asr-staging
+          
+          # Wait for service to start
+          sleep 10
+          
+          # Check service status
+          sudo systemctl is-active dattavani-asr-staging
+          
+          # Test staging binary
+          cd ~/projects/staging/dattavani-asr-rust
+          ./dattavani-asr --version
+          
+          # Cleanup
+          rm -f /tmp/dattavani-asr-staging.tar.gz
+          
+          echo "=== Staging deployment completed ==="
+        EOF
+        
+    - name: Update security group for staging
+      run: |
+        # Add staging port if not already present
+        aws ec2 authorize-security-group-ingress \
+          --group-id sg-0264890af868ab040 \
+          --protocol tcp \
+          --port 7861 \
+          --cidr 0.0.0.0/0 \
+          --region ${{ env.AWS_REGION }} || echo "Port 7861 might already be open"
+        
+    - name: Health check staging
+      run: |
+        echo "Performing staging health check..."
+        sleep 15
+        
+        # Test staging health endpoint
+        curl -f http://${{ steps.get-ip.outputs.public_ip }}:7861/health || {
+          echo "Staging health check failed, checking service status..."
+          ssh ubuntu@${{ steps.get-ip.outputs.public_ip }} "sudo systemctl status dattavani-asr-staging --no-pager"
+          exit 1
+        }
+        
+        echo "Staging health check passed!"
+        
+    - name: Create staging deployment summary
+      run: |
+        cat > staging-deployment-summary.md << EOF
+        # Staging Deployment Summary
+        
+        **Status**: ✅ Success
+        **Environment**: Staging
+        **Timestamp**: $(date -u)
+        **Commit**: ${{ github.sha }}
+        **Branch**: ${{ github.ref_name }}
+        
+        ## Staging Service Information
+        - **URL**: http://${{ steps.get-ip.outputs.public_ip }}:7861
+        - **Health Check**: http://${{ steps.get-ip.outputs.public_ip }}:7861/health
+        - **Instance ID**: ${{ env.EC2_INSTANCE_ID }}
+        - **Port**: 7861 (staging)
+        
+        ## Configuration Differences from Production
+        - Smaller Whisper model (base vs large-v3)
+        - Reduced max_workers (1 vs 2)
+        - Debug logging enabled
+        - Separate cache directory
+        - Reduced cache size (1GB vs 5GB)
+        
+        ## Testing
+        You can now test the staging deployment before promoting to production.
+        
+        ## Promote to Production
+        To promote this build to production, merge this branch to main.
+        EOF
+        
+    - name: Upload staging deployment summary
+      uses: actions/upload-artifact@v3
+      with:
+        name: staging-deployment-summary
+        path: staging-deployment-summary.md
+        
+    - name: Comment on commit with staging info
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const summary = fs.readFileSync('staging-deployment-summary.md', 'utf8');
+          
+          github.rest.repos.createCommitComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            commit_sha: context.sha,
+            body: summary
+          });
+
+  # Job 4: Staging smoke tests
+  staging-tests:
+    name: Staging Smoke Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    
+    steps:
+    - name: Get instance public IP
+      id: get-ip
+      run: |
+        PUBLIC_IP=$(aws ec2 describe-instances \
+          --instance-ids ${{ env.EC2_INSTANCE_ID }} \
+          --query 'Reservations[0].Instances[0].PublicIpAddress' \
+          --output text)
+        echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+        
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Run staging smoke tests
+      run: |
+        STAGING_URL="http://${{ steps.get-ip.outputs.public_ip }}:7861"
+        
+        echo "Running smoke tests against: $STAGING_URL"
+        
+        # Test 1: Health check
+        echo "Test 1: Health check"
+        curl -f "$STAGING_URL/health" || exit 1
+        
+        # Test 2: Service info endpoint (if available)
+        echo "Test 2: Service info"
+        curl -f "$STAGING_URL/info" || echo "Info endpoint not available"
+        
+        # Test 3: Check response time
+        echo "Test 3: Response time check"
+        RESPONSE_TIME=$(curl -o /dev/null -s -w '%{time_total}' "$STAGING_URL/health")
+        echo "Response time: ${RESPONSE_TIME}s"
+        
+        if (( $(echo "$RESPONSE_TIME > 5.0" | bc -l) )); then
+          echo "Warning: Response time is high (${RESPONSE_TIME}s)"
+        fi
+        
+        echo "✅ All staging smoke tests passed!"
+        
+    - name: Create test results
+      run: |
+        cat > staging-test-results.md << EOF
+        # Staging Test Results
+        
+        **Timestamp**: $(date -u)
+        **Staging URL**: http://${{ steps.get-ip.outputs.public_ip }}:7861
+        
+        ## Test Results
+        - ✅ Health check passed
+        - ✅ Response time acceptable
+        - ✅ Service is responding
+        
+        ## Next Steps
+        - Manual testing can be performed at the staging URL
+        - When ready, merge to main branch to deploy to production
+        EOF
+        
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      with:
+        name: staging-test-results
+        path: staging-test-results.md

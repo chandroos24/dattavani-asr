@@ -1,0 +1,101 @@
+# Custom Models Configuration for Dattavani ASR
+# This file defines available models, their configurations, and language mappings
+
+[registry]
+default_model = "whisper-kannada-small"
+confidence_fallback_enabled = true
+min_confidence_threshold = 0.6
+
+# Kannada Models
+[[models]]
+id = "whisper-kannada-small"
+provider = "HuggingFace"
+model_path = "vasista22/whisper-kannada-small"
+language = "kn"
+priority = 1
+confidence_threshold = 0.75
+fallback_models = ["whisper-kannada-base", "whisper-large-v3"]
+
+[models.parameters]
+# Custom parameters for whisper-kannada-small
+
+[[models]]
+id = "whisper-kannada-base"
+provider = "HuggingFace"
+model_path = "vasista22/whisper-kannada-base"
+language = "kn"
+priority = 2
+confidence_threshold = 0.7
+fallback_models = ["whisper-large-v3"]
+
+[models.parameters]
+# Custom parameters for whisper-kannada-base
+
+# English Models
+[[models]]
+id = "whisper-native-base"
+provider = "Native"
+model_path = "base"
+language = "en"
+priority = 1
+confidence_threshold = 0.8
+fallback_models = ["whisper-large-v3"]
+
+[models.parameters]
+# Native Rust implementation - no external dependencies
+
+[[models]]
+id = "whisper-large-v3"
+provider = "WhisperCLI"
+model_path = "large-v3"
+language = "en"
+priority = 2
+confidence_threshold = 0.8
+fallback_models = ["whisper-base"]
+
+[models.parameters]
+# Custom parameters for whisper-large-v3
+
+[[models]]
+id = "whisper-base"
+provider = "WhisperCLI"
+model_path = "base"
+language = "en"
+priority = 2
+confidence_threshold = 0.7
+fallback_models = ["whisper-small"]
+
+[models.parameters]
+# Custom parameters for whisper-base
+
+[[models]]
+id = "whisper-small"
+provider = "WhisperCLI"
+model_path = "small"
+language = "en"
+priority = 3
+confidence_threshold = 0.6
+fallback_models = []
+
+[models.parameters]
+# Custom parameters for whisper-small
+
+# Hindi Models (example for extensibility)
+[[models]]
+id = "whisper-hindi-medium"
+provider = "HuggingFace"
+model_path = "openai/whisper-medium"
+language = "hi"
+priority = 1
+confidence_threshold = 0.75
+fallback_models = ["whisper-large-v3"]
+
+[models.parameters]
+language = "hi"
+
+# Language Mappings
+[language_mappings]
+kn = ["whisper-kannada-small", "whisper-kannada-base", "whisper-large-v3"]
+en = ["whisper-large-v3", "whisper-base", "whisper-small"]
+hi = ["whisper-hindi-medium", "whisper-large-v3"]
+auto = ["whisper-large-v3", "whisper-base"]  # For auto-detection

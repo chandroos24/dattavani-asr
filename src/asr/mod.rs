@@ -2,21 +2,30 @@
 ASR (Automatic Speech Recognition) Module for Dattavani ASR
 
 Integrates with Whisper model for high-accuracy speech recognition.
-Uses Candle framework for Rust-native ML inference.
+Phase 1: Uses simplified, reliable CLI interface
+Phase 2+: Will use native Rust implementation with Candle framework
 */
+
+pub mod models;
+pub mod simple;  // Phase 1: Simple transcription without complex model management
+pub mod native;  // Phase 2: Native Rust implementation with Candle framework
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use futures::future::join_all;
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 
 use crate::config::Config;
 use crate::error::{DattavaniError, Result};
 use crate::streaming::StreamingProcessor;
 use crate::video::VideoProcessor;
 use crate::gdrive::GDriveClient;
+
+pub use models::{ModelManager, ModelConfig, ModelProvider, ModelRegistry, MultiModelResult};
+pub use simple::{SimpleTranscriber, SimpleTranscriptionResult, SimpleTranscriptionOptions};
+pub use native::{NativeTranscriber, NativeWhisperModel, NativeTranscriptionResult, NativeTranscriptionOptions};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptionResult {
@@ -49,164 +58,21 @@ pub struct BatchResult {
 
 pub struct DattavaniAsr {
     config: Config,
-    whisper_model: WhisperModel,
+    model_manager: ModelManager,
     streaming_processor: StreamingProcessor,
     video_processor: VideoProcessor,
     gdrive_client: Option<GDriveClient>,
 }
 
-// Placeholder for Whisper model - in a real implementation, this would use Candle
-pub struct WhisperModel {
-    model_size: String,
-    device: String,
-}
-
-impl WhisperModel {
-    pub async fn load(config: &Config) -> Result<Self> {
-        info!("Loading Whisper model: {}", config.whisper.model_size);
-        
-        // In a real implementation, this would:
-        // 1. Download the model if not cached
-        // 2. Load it using Candle framework
-        // 3. Set up the tokenizer
-        // For now, we'll simulate this
-        
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await; // Simulate loading time
-        
-        Ok(Self {
-            model_size: config.whisper.model_size.clone(),
-            device: config.whisper.device.clone(),
-        })
-    }
-    
-    pub async fn transcribe(&self, audio_path: &Path, language: Option<&str>) -> Result<TranscriptionResult> {
-        let start_time = std::time::Instant::now();
-        
-        info!("Transcribing audio file: {}", audio_path.display());
-        
-        // In a real implementation, this would:
-        // 1. Load and preprocess the audio
-        // 2. Run inference using the Whisper model
-        // 3. Post-process the results
-        // For now, we'll use the whisper CLI as a fallback
-        
-        self.transcribe_with_cli(audio_path, language).await
-            .map(|mut result| {
-                result.processing_time = Some(start_time.elapsed().as_secs_f64());
-                result
-            })
-    }
-    
-    async fn transcribe_with_cli(&self, audio_path: &Path, language: Option<&str>) -> Result<TranscriptionResult> {
-        use tokio::process::Command;
-        
-        let mut cmd = Command::new("whisper");
-        cmd.arg(audio_path.to_str().unwrap());
-        cmd.args(&["--model", &self.model_size]);
-        cmd.args(&["--output_format", "json"]);
-        cmd.args(&["--output_dir", "/tmp"]);
-        
-        if let Some(lang) = language {
-            cmd.args(&["--language", lang]);
-        }
-        
-        let output = cmd.output().await
-            .map_err(|e| DattavaniError::whisper_model(format!("Whisper CLI failed: {}", e)))?;
-        
-        if !output.status.success() {
-            let error_msg = String::from_utf8_lossy(&output.stderr);
-            return Ok(TranscriptionResult {
-                success: false,
-                text: None,
-                error: Some(format!("Whisper error: {}", error_msg)),
-                processing_time: None,
-                confidence: None,
-                language: None,
-                segments: None,
-                file_path: Some(audio_path.to_string_lossy().to_string()),
-            });
-        }
-        
-        // Parse Whisper JSON output
-        let json_file = audio_path.with_extension("json");
-        if tokio::fs::metadata(&json_file).await.is_ok() {
-            let json_content = tokio::fs::read_to_string(&json_file).await
-                .map_err(DattavaniError::FileIo)?;
-            
-            let whisper_result: serde_json::Value = serde_json::from_str(&json_content)
-                .map_err(DattavaniError::Serialization)?;
-            
-            let text = whisper_result["text"].as_str()
-                .unwrap_or("")
-                .to_string();
-            
-            let language = whisper_result["language"].as_str()
-                .map(|s| s.to_string());
-            
-            let segments = if let Some(segments_array) = whisper_result["segments"].as_array() {
-                let mut segments = Vec::new();
-                for segment in segments_array {
-                    segments.push(TranscriptionSegment {
-                        start: segment["start"].as_f64().unwrap_or(0.0),
-                        end: segment["end"].as_f64().unwrap_or(0.0),
-                        text: segment["text"].as_str().unwrap_or("").to_string(),
-                        confidence: segment["confidence"].as_f64(),
-                    });
-                }
-                Some(segments)
-            } else {
-                None
-            };
-            
-            // Calculate average confidence
-            let confidence = segments.as_ref()
-                .and_then(|segs| {
-                    let confidences: Vec<f64> = segs.iter()
-                        .filter_map(|s| s.confidence)
-                        .collect();
-                    if !confidences.is_empty() {
-                        Some(confidences.iter().sum::<f64>() / confidences.len() as f64)
-                    } else {
-                        None
-                    }
-                });
-            
-            // Clean up JSON file
-            let _ = tokio::fs::remove_file(&json_file).await;
-            
-            Ok(TranscriptionResult {
-                success: true,
-                text: Some(text),
-                error: None,
-                processing_time: None,
-                confidence,
-                language,
-                segments,
-                file_path: Some(audio_path.to_string_lossy().to_string()),
-            })
-        } else {
-            // Fallback: parse stdout
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            Ok(TranscriptionResult {
-                success: true,
-                text: Some(stdout.to_string()),
-                error: None,
-                processing_time: None,
-                confidence: None,
-                language: language.map(|s| s.to_string()),
-                segments: None,
-                file_path: Some(audio_path.to_string_lossy().to_string()),
-            })
-        }
-    }
-}
+// Remove the old WhisperModel struct and implementation
+// It's now replaced by the pluggable ModelManager system
 
 impl DattavaniAsr {
     pub async fn new(config: Config) -> Result<Self> {
-        info!("Initializing Dattavani ASR");
+        info!("Initializing Dattavani ASR with pluggable model system");
         
-        // Load Whisper model
-        let whisper_model = WhisperModel::load(&config).await?;
+        // Initialize model manager with config-based model loading
+        let model_manager = ModelManager::new_with_config(config.clone()).await?;
         
         // Initialize processors
         let streaming_processor = StreamingProcessor::new(config.clone())?
@@ -222,7 +88,34 @@ impl DattavaniAsr {
         
         Ok(Self {
             config,
-            whisper_model,
+            model_manager,
+            streaming_processor,
+            video_processor,
+            gdrive_client,
+        })
+    }
+    
+    pub async fn new_with_custom_models(config: Config, model_registry: ModelRegistry) -> Result<Self> {
+        info!("Initializing Dattavani ASR with custom model registry");
+        
+        // Initialize model manager with custom registry
+        let model_manager = ModelManager::with_registry(config.clone(), model_registry);
+        
+        // Initialize processors
+        let streaming_processor = StreamingProcessor::new(config.clone())?
+            .with_gdrive().await?;
+        let video_processor = VideoProcessor::new(config.clone());
+        
+        // Initialize Google Drive client if credentials are available
+        let gdrive_client = if config.google.application_credentials.is_some() {
+            Some(GDriveClient::new(config.clone()).await?)
+        } else {
+            None
+        };
+        
+        Ok(Self {
+            config,
+            model_manager,
             streaming_processor,
             video_processor,
             gdrive_client,
@@ -260,9 +153,11 @@ impl DattavaniAsr {
         let audio_path = streaming_result.audio_path
             .ok_or_else(|| DattavaniError::asr_processing("No audio path in streaming result"))?;
         
-        // Transcribe the audio
-        let mut transcription_result = self.whisper_model
-            .transcribe(&audio_path, language).await?;
+        // Transcribe the audio using the best available model
+        let multi_model_result = self.model_manager
+            .transcribe_with_best_model(&audio_path, language, Some(3)).await?;
+        
+        let mut transcription_result = multi_model_result.final_result;
         
         // Save transcript if output URI is provided
         if let Some(output) = output_uri {

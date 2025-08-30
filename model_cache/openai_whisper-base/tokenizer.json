@@ -1,0 +1,16 @@
+{
+  "added_tokens": [],
+  "decoder": null,
+  "demo_mode": true,
+  "model": {
+    "merges": [],
+    "type": "BPE",
+    "vocab": {}
+  },
+  "normalizer": null,
+  "padding": null,
+  "post_processor": null,
+  "pre_tokenizer": null,
+  "truncation": null,
+  "version": "1.0"
+}

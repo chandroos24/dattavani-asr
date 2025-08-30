@@ -1,0 +1,299 @@
+name: Test and Validate
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+  push:
+    branches: [ develop, feature/* ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Job 1: Code quality checks
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+        components: rustfmt, clippy
+        
+    - name: Cache Rust dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+          
+    - name: Check formatting
+      run: cargo fmt -- --check
+      
+    - name: Run Clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+      
+    - name: Check for unused dependencies
+      run: |
+        cargo install cargo-machete
+        cargo machete
+
+  # Job 2: Cross-platform testing
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable, beta]
+        exclude:
+          - os: macos-latest
+            rust: beta
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: ${{ matrix.rust }}
+        override: true
+        
+    - name: Cache Rust dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-${{ matrix.rust }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ matrix.rust }}-cargo-
+          
+    - name: Install system dependencies (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg pkg-config libssl-dev
+        
+    - name: Install system dependencies (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        brew install ffmpeg pkg-config openssl
+        
+    - name: Run tests
+      run: cargo test --verbose --all-features
+      
+    - name: Run integration tests
+      run: cargo test --test integration_tests --verbose
+      
+    - name: Build release
+      run: cargo build --release --verbose
+
+  # Job 3: Security and dependency audit
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+        
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+      
+    - name: Run security audit
+      run: cargo audit
+      
+    - name: Run cargo-deny
+      uses: EmbarkStudios/cargo-deny-action@v1
+      with:
+        log-level: warn
+        command: check
+        arguments: --all-features
+
+  # Job 4: Documentation check
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+        
+    - name: Check documentation
+      run: cargo doc --no-deps --document-private-items --all-features
+      
+    - name: Check for broken links in docs
+      run: |
+        cargo install cargo-deadlinks
+        cargo doc --no-deps
+        cargo deadlinks --dir target/doc
+
+  # Job 5: Performance benchmarks
+  benchmarks:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+        
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg pkg-config libssl-dev
+        
+    - name: Run benchmarks
+      run: cargo bench --verbose
+      
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v3
+      with:
+        name: benchmark-results
+        path: target/criterion/
+
+  # Job 6: Docker build test
+  docker:
+    name: Docker Build Test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Build Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: false
+        tags: dattavani-asr:test
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: Test Docker image
+      run: |
+        docker run --rm dattavani-asr:test dattavani-asr --version
+        docker run --rm dattavani-asr:test dattavani-asr health-check
+
+  # Job 7: Configuration validation
+  config-validation:
+    name: Configuration Validation
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Validate TOML configuration
+      run: |
+        # Install toml-cli for validation
+        cargo install toml-cli
+        
+        # Validate configuration templates
+        if [ -f "dattavani-asr.toml.template" ]; then
+          toml get dattavani-asr.toml.template . > /dev/null
+          echo "✅ TOML configuration template is valid"
+        fi
+        
+    - name: Validate deployment scripts
+      run: |
+        # Check shell scripts syntax
+        find aws-deployment -name "*.sh" -exec bash -n {} \;
+        echo "✅ All shell scripts have valid syntax"
+        
+    - name: Validate Docker Compose
+      run: |
+        if [ -f "aws-deployment/docker-compose.yml" ]; then
+          docker-compose -f aws-deployment/docker-compose.yml config > /dev/null
+          echo "✅ Docker Compose configuration is valid"
+        fi
+
+  # Job 8: Generate test report
+  test-report:
+    name: Generate Test Report
+    runs-on: ubuntu-latest
+    needs: [code-quality, test, security, docs, docker, config-validation]
+    if: always()
+    
+    steps:
+    - name: Create test report
+      run: |
+        cat > test-report.md << EOF
+        # Test Report
+        
+        **Timestamp**: $(date -u)
+        **Commit**: ${{ github.sha }}
+        **Branch**: ${{ github.ref_name }}
+        **PR**: ${{ github.event.number }}
+        
+        ## Test Results
+        
+        | Job | Status |
+        |-----|--------|
+        | Code Quality | ${{ needs.code-quality.result == 'success' && '✅ Pass' || '❌ Fail' }} |
+        | Tests | ${{ needs.test.result == 'success' && '✅ Pass' || '❌ Fail' }} |
+        | Security | ${{ needs.security.result == 'success' && '✅ Pass' || '❌ Fail' }} |
+        | Documentation | ${{ needs.docs.result == 'success' && '✅ Pass' || '❌ Fail' }} |
+        | Docker Build | ${{ needs.docker.result == 'success' && '✅ Pass' || '❌ Fail' }} |
+        | Configuration | ${{ needs.config-validation.result == 'success' && '✅ Pass' || '❌ Fail' }} |
+        
+        ## Summary
+        
+        ${{ needs.code-quality.result == 'success' && needs.test.result == 'success' && needs.security.result == 'success' && needs.docs.result == 'success' && needs.docker.result == 'success' && needs.config-validation.result == 'success' && '🎉 All tests passed! Ready for deployment.' || '⚠️ Some tests failed. Please review and fix issues before merging.' }}
+        EOF
+        
+    - name: Upload test report
+      uses: actions/upload-artifact@v3
+      with:
+        name: test-report
+        path: test-report.md
+        
+    - name: Comment PR with test results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const report = fs.readFileSync('test-report.md', 'utf8');
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: report
+          });

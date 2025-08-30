@@ -13,6 +13,7 @@ use crate::error::{DattavaniError, Result};
 pub struct Config {
     pub google: GoogleConfig,
     pub whisper: WhisperConfig,
+    pub models: ModelsConfig,
     pub processing: ProcessingConfig,
     pub logging: LoggingConfig,
     pub storage: StorageConfig,
@@ -34,6 +35,15 @@ pub struct WhisperConfig {
     pub compute_type: String,
     pub language: Option<String>,
     pub task: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsConfig {
+    pub default_model: String,
+    pub confidence_fallback_enabled: bool,
+    pub min_confidence_threshold: f64,
+    pub max_model_attempts: usize,
+    pub custom_models_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +78,7 @@ impl Default for Config {
         Self {
             google: GoogleConfig::default(),
             whisper: WhisperConfig::default(),
+            models: ModelsConfig::default(),
             processing: ProcessingConfig::default(),
             logging: LoggingConfig::default(),
             storage: StorageConfig::default(),
@@ -103,6 +114,30 @@ impl Default for WhisperConfig {
             language: env::var("WHISPER_LANGUAGE").ok(),
             task: env::var("WHISPER_TASK")
                 .unwrap_or_else(|_| "transcribe".to_string()),
+        }
+    }
+}
+
+impl Default for ModelsConfig {
+    fn default() -> Self {
+        Self {
+            default_model: env::var("DEFAULT_MODEL")
+                .unwrap_or_else(|_| "whisper-kannada-small".to_string()),
+            confidence_fallback_enabled: env::var("CONFIDENCE_FALLBACK_ENABLED")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(true),
+            min_confidence_threshold: env::var("MIN_CONFIDENCE_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.6),
+            max_model_attempts: env::var("MAX_MODEL_ATTEMPTS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3),
+            custom_models_file: env::var("CUSTOM_MODELS_FILE")
+                .ok()
+                .map(PathBuf::from),
         }
     }
 }
@@ -233,9 +268,10 @@ impl Config {
         
         // Validate Whisper model size
         let valid_models = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"];
-        if !valid_models.contains(&self.whisper.model_size.as_str()) {
+        // Allow custom Hugging Face models (contain '/' character)
+        if !valid_models.contains(&self.whisper.model_size.as_str()) && !self.whisper.model_size.contains('/') {
             return Err(DattavaniError::configuration(
-                format!("Invalid Whisper model size: {}. Valid options: {:?}", 
+                format!("Invalid Whisper model size: {}. Valid options: {:?} or Hugging Face model format (e.g., 'user/model-name')", 
                        self.whisper.model_size, valid_models)
             ));
         }

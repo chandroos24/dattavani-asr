@@ -17,6 +17,7 @@ This Rust implementation provides significant advantages over the Python version
 - **High Accuracy**: Uses OpenAI Whisper large-v3 model for near 99% transcription accuracy
 - **🎬 Video Support**: Processes 25+ video formats (MP4, AVI, MOV, MKV, WebM, FLV, WMV, etc.)
 - **🎵 Audio Support**: Multiple audio formats (MP3, WAV, M4A, FLAC, OGG, WMA, AAC)
+- **✂️ Video Segment Capture**: Capture specific time segments from videos with precise HH:MM:SS timing
 - **🌊 Streaming-Only Processing**: **No downloads required** - processes files directly from streams
 - **💾 Space Efficient**: Conserves storage by avoiding temporary file downloads
 - **Google Drive Integration**: Seamlessly processes files from Google Drive using official API
@@ -54,7 +55,23 @@ This Rust implementation provides significant advantages over the Python version
 
 ## 🚀 Quick Start
 
-### Installation
+### Automated Installation
+
+**Linux (Universal)**:
+```bash
+git clone https://github.com/your-username/dattavani-asr-rust.git
+cd dattavani-asr-rust
+./scripts/install-linux.sh
+```
+
+**macOS**:
+```bash
+git clone https://github.com/your-username/dattavani-asr-rust.git
+cd dattavani-asr-rust
+./scripts/install-macos.sh
+```
+
+### Manual Installation
 
 1. **Clone the repository**:
    ```bash
@@ -97,6 +114,35 @@ This Rust implementation provides significant advantages over the Python version
 
 ```bash
 ./target/release/dattavani-asr stream-process "https://drive.google.com/file/d/YOUR_FILE_ID/view"
+```
+
+#### Capture Video Segment and Process ASR
+
+```bash
+./target/release/dattavani-asr capture-and-process \
+  --start-time 00:01:30 \
+  --end-time 00:05:00 \
+  --title "meeting-segment" \
+  --language en \
+  "path/to/video.mp4"
+```
+
+This command will:
+1. Capture video segment from 1:30 to 5:00
+2. Save captured video as MP4 in timestamped subfolder
+3. Extract audio as MP3 from the captured video
+4. Perform ASR transcription and save as TXT
+5. All files saved in `/Volumes/ssd1/video-capture/meeting-segment-YYYYMMDD_HHMMSS/`
+
+#### Capture from Google Drive Video
+
+```bash
+./target/release/dattavani-asr capture-and-process \
+  --start-time 00:10:00 \
+  --end-time 00:15:30 \
+  --title "presentation-demo" \
+  --language hi \
+  "https://drive.google.com/file/d/YOUR_FILE_ID/view"
 ```
 
 #### Process Large Videos with Streaming Segmentation

@@ -1,0 +1,380 @@
+name: Rollback Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to rollback'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+      rollback_to:
+        description: 'Rollback to (commit SHA or "previous")'
+        required: true
+        default: 'previous'
+        type: string
+      reason:
+        description: 'Reason for rollback'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  EC2_INSTANCE_ID: i-09726de87ad1f9596
+
+jobs:
+  # Job 1: Validate rollback request
+  validate-rollback:
+    name: Validate Rollback Request
+    runs-on: ubuntu-latest
+    
+    outputs:
+      target_commit: ${{ steps.validate.outputs.target_commit }}
+      service_port: ${{ steps.validate.outputs.service_port }}
+      service_name: ${{ steps.validate.outputs.service_name }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch full history for rollback
+        
+    - name: Validate rollback target
+      id: validate
+      run: |
+        if [ "${{ github.event.inputs.rollback_to }}" = "previous" ]; then
+          # Get the previous commit
+          TARGET_COMMIT=$(git rev-parse HEAD~1)
+        else
+          # Use specified commit
+          TARGET_COMMIT="${{ github.event.inputs.rollback_to }}"
+          
+          # Validate commit exists
+          if ! git cat-file -e "$TARGET_COMMIT^{commit}"; then
+            echo "Error: Commit $TARGET_COMMIT does not exist"
+            exit 1
+          fi
+        fi
+        
+        echo "target_commit=$TARGET_COMMIT" >> $GITHUB_OUTPUT
+        
+        # Set environment-specific variables
+        if [ "${{ github.event.inputs.environment }}" = "staging" ]; then
+          echo "service_port=7861" >> $GITHUB_OUTPUT
+          echo "service_name=dattavani-asr-staging" >> $GITHUB_OUTPUT
+        else
+          echo "service_port=7860" >> $GITHUB_OUTPUT
+          echo "service_name=dattavani-asr" >> $GITHUB_OUTPUT
+        fi
+        
+        echo "Rollback validated:"
+        echo "- Environment: ${{ github.event.inputs.environment }}"
+        echo "- Target commit: $TARGET_COMMIT"
+        echo "- Reason: ${{ github.event.inputs.reason }}"
+
+  # Job 2: Create backup before rollback
+  create-backup:
+    name: Create Backup
+    runs-on: ubuntu-latest
+    needs: [validate-rollback]
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Create AMI backup
+      run: |
+        echo "Creating AMI backup before rollback..."
+        
+        TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+        AMI_NAME="dattavani-asr-pre-rollback-$TIMESTAMP"
+        
+        AMI_ID=$(aws ec2 create-image \
+          --instance-id ${{ env.EC2_INSTANCE_ID }} \
+          --name "$AMI_NAME" \
+          --description "Backup before rollback to ${{ needs.validate-rollback.outputs.target_commit }}" \
+          --query 'ImageId' \
+          --output text)
+        
+        echo "AMI backup created: $AMI_ID"
+        
+        # Tag the AMI
+        aws ec2 create-tags \
+          --resources $AMI_ID \
+          --tags Key=Name,Value="$AMI_NAME" \
+                 Key=Project,Value="dattavani-asr-rust" \
+                 Key=Type,Value="Pre-Rollback-Backup" \
+                 Key=Environment,Value="${{ github.event.inputs.environment }}" \
+                 Key=RollbackReason,Value="${{ github.event.inputs.reason }}" \
+                 Key=CreatedDate,Value="$TIMESTAMP"
+        
+        echo "AMI_ID=$AMI_ID" >> $GITHUB_ENV
+
+  # Job 3: Build rollback version
+  build-rollback:
+    name: Build Rollback Version
+    runs-on: ubuntu-latest
+    needs: [validate-rollback]
+    
+    steps:
+    - name: Checkout rollback target
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ needs.validate-rollback.outputs.target_commit }}
+        
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+        
+    - name: Cache Rust dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: rollback-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        
+    - name: Build rollback binary
+      run: |
+        echo "Building rollback version from commit ${{ needs.validate-rollback.outputs.target_commit }}"
+        cargo build --release
+        
+    - name: Upload rollback binary
+      uses: actions/upload-artifact@v3
+      with:
+        name: dattavani-asr-rollback
+        path: target/release/dattavani-asr
+        retention-days: 7
+
+  # Job 4: Execute rollback
+  execute-rollback:
+    name: Execute Rollback
+    runs-on: ubuntu-latest
+    needs: [validate-rollback, create-backup, build-rollback]
+    
+    environment: 
+      name: ${{ github.event.inputs.environment }}
+      url: http://${{ steps.get-ip.outputs.public_ip }}:${{ needs.validate-rollback.outputs.service_port }}
+    
+    steps:
+    - name: Checkout rollback target
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ needs.validate-rollback.outputs.target_commit }}
+        
+    - name: Download rollback binary
+      uses: actions/download-artifact@v3
+      with:
+        name: dattavani-asr-rollback
+        path: target/release/
+        
+    - name: Make binary executable
+      run: chmod +x target/release/dattavani-asr
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Ensure EC2 instance is running
+      run: |
+        STATE=$(aws ec2 describe-instances \
+          --instance-ids ${{ env.EC2_INSTANCE_ID }} \
+          --query 'Reservations[0].Instances[0].State.Name' \
+          --output text)
+        
+        if [ "$STATE" != "running" ]; then
+          echo "Starting EC2 instance..."
+          aws ec2 start-instances --instance-ids ${{ env.EC2_INSTANCE_ID }}
+          aws ec2 wait instance-running --instance-ids ${{ env.EC2_INSTANCE_ID }}
+          sleep 30
+        fi
+        
+    - name: Get instance public IP
+      id: get-ip
+      run: |
+        PUBLIC_IP=$(aws ec2 describe-instances \
+          --instance-ids ${{ env.EC2_INSTANCE_ID }} \
+          --query 'Reservations[0].Instances[0].PublicIpAddress' \
+          --output text)
+        echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+        echo "Instance public IP: $PUBLIC_IP"
+        
+    - name: Setup SSH key
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H ${{ steps.get-ip.outputs.public_ip }} >> ~/.ssh/known_hosts
+        
+    - name: Create rollback package
+      run: |
+        tar -czf dattavani-asr-rollback.tar.gz \
+          target/release/dattavani-asr \
+          aws-deployment/ \
+          dattavani-asr.toml.template \
+          .env.template
+          
+    - name: Execute rollback deployment
+      run: |
+        # Upload rollback package
+        scp dattavani-asr-rollback.tar.gz ubuntu@${{ steps.get-ip.outputs.public_ip }}:/tmp/
+        
+        # Execute rollback
+        ssh ubuntu@${{ steps.get-ip.outputs.public_ip }} << EOF
+          set -e
+          
+          echo "=== Executing rollback ==="
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Target commit: ${{ needs.validate-rollback.outputs.target_commit }}"
+          echo "Reason: ${{ github.event.inputs.reason }}"
+          
+          # Stop the current service
+          sudo systemctl stop ${{ needs.validate-rollback.outputs.service_name }}
+          
+          # Determine project directory based on environment
+          if [ "${{ github.event.inputs.environment }}" = "staging" ]; then
+            PROJECT_DIR="~/projects/staging"
+          else
+            PROJECT_DIR="~/projects"
+          fi
+          
+          cd \$PROJECT_DIR
+          
+          # Backup current version
+          if [ -d "dattavani-asr-rust" ]; then
+            mv dattavani-asr-rust dattavani-asr-rust_pre_rollback_\$(date +%Y%m%d_%H%M%S)
+          fi
+          
+          # Extract rollback version
+          tar -xzf /tmp/dattavani-asr-rollback.tar.gz
+          mv target/release/dattavani-asr dattavani-asr-rust/
+          chmod +x dattavani-asr-rust/dattavani-asr
+          
+          # Test rollback binary
+          cd dattavani-asr-rust
+          ./dattavani-asr --version
+          ./dattavani-asr health-check
+          
+          # Start the service with rollback version
+          sudo systemctl start ${{ needs.validate-rollback.outputs.service_name }}
+          
+          # Wait for service to start
+          sleep 10
+          
+          # Verify service is running
+          sudo systemctl is-active ${{ needs.validate-rollback.outputs.service_name }}
+          
+          # Cleanup
+          rm -f /tmp/dattavani-asr-rollback.tar.gz
+          
+          echo "=== Rollback completed successfully ==="
+        EOF
+        
+    - name: Verify rollback
+      run: |
+        echo "Verifying rollback..."
+        sleep 15
+        
+        # Test health endpoint
+        curl -f http://${{ steps.get-ip.outputs.public_ip }}:${{ needs.validate-rollback.outputs.service_port }}/health || {
+          echo "Rollback verification failed!"
+          ssh ubuntu@${{ steps.get-ip.outputs.public_ip }} "sudo systemctl status ${{ needs.validate-rollback.outputs.service_name }} --no-pager"
+          exit 1
+        }
+        
+        echo "✅ Rollback verification successful!"
+
+  # Job 5: Create rollback report
+  create-rollback-report:
+    name: Create Rollback Report
+    runs-on: ubuntu-latest
+    needs: [validate-rollback, create-backup, execute-rollback]
+    if: always()
+    
+    steps:
+    - name: Create rollback report
+      run: |
+        cat > rollback-report.md << EOF
+        # Rollback Report
+        
+        **Status**: ${{ needs.execute-rollback.result == 'success' && '✅ Success' || '❌ Failed' }}
+        **Timestamp**: $(date -u)
+        **Environment**: ${{ github.event.inputs.environment }}
+        **Initiated by**: ${{ github.actor }}
+        
+        ## Rollback Details
+        - **From commit**: ${{ github.sha }}
+        - **To commit**: ${{ needs.validate-rollback.outputs.target_commit }}
+        - **Reason**: ${{ github.event.inputs.reason }}
+        - **Service**: ${{ needs.validate-rollback.outputs.service_name }}
+        - **Port**: ${{ needs.validate-rollback.outputs.service_port }}
+        
+        ## Backup Information
+        - **AMI Backup**: Created before rollback
+        - **Previous version**: Backed up on server
+        
+        ## Verification
+        ${{ needs.execute-rollback.result == 'success' && '✅ Service health check passed after rollback' || '❌ Service health check failed' }}
+        
+        ## Next Steps
+        ${{ needs.execute-rollback.result == 'success' && '- Monitor the rolled-back service for stability\n- Investigate and fix the issues that caused the rollback\n- Plan for redeployment when issues are resolved' || '- Check the deployment logs for errors\n- Consider manual intervention\n- Contact the development team if needed' }}
+        
+        ## Service URL
+        http://${{ steps.get-ip.outputs.public_ip }}:${{ needs.validate-rollback.outputs.service_port }}
+        EOF
+        
+    - name: Upload rollback report
+      uses: actions/upload-artifact@v3
+      with:
+        name: rollback-report
+        path: rollback-report.md
+        
+    - name: Create GitHub issue for rollback
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const report = fs.readFileSync('rollback-report.md', 'utf8');
+          
+          const issue = await github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: `🔄 Rollback Executed - ${{ github.event.inputs.environment }} environment`,
+            body: `${report}\n\n**Workflow Run**: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            labels: ['rollback', 'deployment', '${{ github.event.inputs.environment }}']
+          });
+          
+          console.log(`Created issue #${issue.data.number}`);
+
+  # Job 6: Notify team
+  notify-team:
+    name: Notify Team
+    runs-on: ubuntu-latest
+    needs: [validate-rollback, execute-rollback]
+    if: always()
+    
+    steps:
+    - name: Create notification
+      run: |
+        if [ "${{ needs.execute-rollback.result }}" = "success" ]; then
+          echo "✅ Rollback completed successfully"
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Reason: ${{ github.event.inputs.reason }}"
+          echo "Initiated by: ${{ github.actor }}"
+        else
+          echo "❌ Rollback failed"
+          echo "Check the workflow logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        fi

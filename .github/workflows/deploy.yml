@@ -1,0 +1,417 @@
+name: Deploy Dattavani ASR to AWS
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+  pull_request:
+    branches: [ main ]
+    types: [ closed ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+      force_deploy:
+        description: 'Force deployment even if tests fail'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  CARGO_TERM_COLOR: always
+  AWS_REGION: us-east-1
+  EC2_INSTANCE_ID: i-09726de87ad1f9596
+  S3_BUCKET: dattavani
+
+jobs:
+  # Job 1: Run tests and build
+  test-and-build:
+    name: Test and Build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+        components: rustfmt, clippy
+        
+    - name: Cache Rust dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+          
+    - name: Check formatting
+      run: cargo fmt -- --check
+      
+    - name: Run Clippy
+      run: cargo clippy -- -D warnings
+      
+    - name: Run tests
+      run: cargo test --verbose
+      
+    - name: Build release binary
+      run: cargo build --release --verbose
+      
+    - name: Upload binary artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: dattavani-asr-binary
+        path: target/release/dattavani-asr
+        retention-days: 7
+
+  # Job 2: Security scan
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: test-and-build
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+        
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+      
+    - name: Run security audit
+      run: cargo audit
+      
+    - name: Run cargo-deny
+      uses: EmbarkStudios/cargo-deny-action@v1
+
+  # Job 3: Deploy to AWS
+  deploy:
+    name: Deploy to AWS
+    runs-on: ubuntu-latest
+    needs: [test-and-build, security-scan]
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    
+    environment: 
+      name: ${{ github.event.inputs.environment || 'production' }}
+      url: http://${{ steps.get-ip.outputs.public_ip }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Download binary artifact
+      uses: actions/download-artifact@v3
+      with:
+        name: dattavani-asr-binary
+        path: target/release/
+        
+    - name: Make binary executable
+      run: chmod +x target/release/dattavani-asr
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Verify AWS credentials
+      run: aws sts get-caller-identity
+      
+    - name: Start EC2 instance
+      run: |
+        echo "Starting EC2 instance..."
+        aws ec2 start-instances --instance-ids ${{ env.EC2_INSTANCE_ID }}
+        
+        echo "Waiting for instance to be running..."
+        aws ec2 wait instance-running --instance-ids ${{ env.EC2_INSTANCE_ID }}
+        
+        echo "Waiting additional time for SSH to be ready..."
+        sleep 30
+        
+    - name: Get instance public IP
+      id: get-ip
+      run: |
+        PUBLIC_IP=$(aws ec2 describe-instances \
+          --instance-ids ${{ env.EC2_INSTANCE_ID }} \
+          --query 'Reservations[0].Instances[0].PublicIpAddress' \
+          --output text)
+        echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+        echo "Instance public IP: $PUBLIC_IP"
+        
+    - name: Setup SSH key
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H ${{ steps.get-ip.outputs.public_ip }} >> ~/.ssh/known_hosts
+        
+    - name: Test SSH connection
+      run: |
+        ssh -o ConnectTimeout=30 ubuntu@${{ steps.get-ip.outputs.public_ip }} "echo 'SSH connection successful'"
+        
+    - name: Create deployment package
+      run: |
+        tar -czf dattavani-asr-deployment.tar.gz \
+          target/release/dattavani-asr \
+          aws-deployment/ \
+          dattavani-asr.toml.template \
+          .env.template \
+          README.md
+          
+    - name: Upload deployment package
+      run: |
+        scp dattavani-asr-deployment.tar.gz ubuntu@${{ steps.get-ip.outputs.public_ip }}:/tmp/
+        
+    - name: Deploy application
+      run: |
+        ssh ubuntu@${{ steps.get-ip.outputs.public_ip }} << 'EOF'
+          set -e
+          
+          echo "=== Starting deployment ==="
+          
+          # Create project directory
+          mkdir -p ~/projects
+          cd ~/projects
+          
+          # Backup existing installation
+          if [ -d "dattavani-asr-rust" ]; then
+            echo "Backing up existing installation..."
+            mv dattavani-asr-rust dattavani-asr-rust_backup_$(date +%Y%m%d_%H%M%S)
+          fi
+          
+          # Extract new version
+          tar -xzf /tmp/dattavani-asr-deployment.tar.gz
+          mv target/release/dattavani-asr dattavani-asr-rust/
+          chmod +x dattavani-asr-rust/dattavani-asr
+          
+          # Update system packages
+          sudo apt update
+          
+          # Install dependencies if not present
+          if ! command -v ffmpeg &> /dev/null; then
+            echo "Installing FFmpeg..."
+            sudo apt install -y ffmpeg
+          fi
+          
+          if ! command -v whisper &> /dev/null; then
+            echo "Installing Whisper..."
+            pip3 install --user openai-whisper
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+            export PATH="$HOME/.local/bin:$PATH"
+          fi
+          
+          if ! command -v nginx &> /dev/null; then
+            echo "Installing Nginx..."
+            sudo apt install -y nginx
+          fi
+          
+          # Setup configuration
+          mkdir -p ~/.config/dattavani-asr ~/logs ~/.cache/dattavani-asr /tmp/dattavani_asr
+          
+          # Create configuration file
+          cat > ~/.config/dattavani-asr/dattavani-asr.toml << 'TOML_EOF'
+        [aws]
+        region = "us-east-1"
+        s3_bucket = "dattavani"
+
+        [whisper]
+        model_size = "large-v3"
+        device = "auto"
+        compute_type = "float16"
+        task = "transcribe"
+
+        [processing]
+        max_workers = 2
+        segment_duration = 300
+        target_sample_rate = 16000
+        chunk_size = 8192
+        timeout_seconds = 3600
+        retry_attempts = 3
+
+        [logging]
+        level = "info"
+        file = "/home/ubuntu/logs/dattavani-asr.log"
+        max_file_size = 10485760
+        max_files = 7
+
+        [storage]
+        temp_dir = "/tmp/dattavani_asr"
+        cache_dir = "/home/ubuntu/.cache/dattavani-asr"
+        output_prefix = "gen-transcript"
+        max_cache_size = 5368709120
+        TOML_EOF
+          
+          # Create environment file
+          cat > ~/.env << 'ENV_EOF'
+        RUST_LOG=info
+        AWS_REGION=us-east-1
+        S3_BUCKET=dattavani
+        WHISPER_MODEL_SIZE=large-v3
+        MAX_WORKERS=2
+        TEMP_DIR=/tmp/dattavani_asr
+        CACHE_DIR=/home/ubuntu/.cache/dattavani-asr
+        CONFIG_PATH=/home/ubuntu/.config/dattavani-asr/dattavani-asr.toml
+        ENV_EOF
+          
+          # Setup systemd service
+          sudo tee /etc/systemd/system/dattavani-asr.service > /dev/null << 'SERVICE_EOF'
+        [Unit]
+        Description=Dattavani ASR Rust Service
+        After=network.target
+
+        [Service]
+        Type=simple
+        User=ubuntu
+        WorkingDirectory=/home/ubuntu/projects/dattavani-asr-rust
+        ExecStart=/home/ubuntu/projects/dattavani-asr-rust/dattavani-asr server --port 7860
+        Restart=always
+        RestartSec=10
+        Environment=RUST_LOG=info
+        Environment=CONFIG_PATH=/home/ubuntu/.config/dattavani-asr/dattavani-asr.toml
+        EnvironmentFile=/home/ubuntu/.env
+
+        [Install]
+        WantedBy=multi-user.target
+        SERVICE_EOF
+          
+          # Setup Nginx configuration
+          sudo tee /etc/nginx/sites-available/dattavani-asr > /dev/null << 'NGINX_EOF'
+        server {
+            listen 80;
+            server_name _;
+
+            location / {
+                proxy_pass http://127.0.0.1:7860;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection "upgrade";
+                
+                proxy_connect_timeout 300s;
+                proxy_send_timeout 300s;
+                proxy_read_timeout 300s;
+                
+                client_max_body_size 100M;
+            }
+        }
+        NGINX_EOF
+          
+          # Enable services
+          sudo ln -sf /etc/nginx/sites-available/dattavani-asr /etc/nginx/sites-enabled/
+          sudo rm -f /etc/nginx/sites-enabled/default
+          
+          sudo systemctl daemon-reload
+          sudo systemctl enable dattavani-asr
+          sudo systemctl enable nginx
+          
+          # Test configuration
+          sudo nginx -t
+          
+          # Test binary
+          cd ~/projects/dattavani-asr-rust
+          ./dattavani-asr --version
+          ./dattavani-asr health-check
+          
+          # Start services
+          sudo systemctl restart nginx
+          sudo systemctl restart dattavani-asr
+          
+          # Wait for service to start
+          sleep 10
+          
+          # Check service status
+          sudo systemctl is-active dattavani-asr
+          sudo systemctl is-active nginx
+          
+          # Cleanup
+          rm -f /tmp/dattavani-asr-deployment.tar.gz
+          
+          echo "=== Deployment completed successfully ==="
+        EOF
+        
+    - name: Health check
+      run: |
+        echo "Performing health check..."
+        sleep 15
+        
+        # Test health endpoint
+        curl -f http://${{ steps.get-ip.outputs.public_ip }}/health || {
+          echo "Health check failed, checking service status..."
+          ssh ubuntu@${{ steps.get-ip.outputs.public_ip }} "sudo systemctl status dattavani-asr --no-pager"
+          exit 1
+        }
+        
+        echo "Health check passed!"
+        
+    - name: Update deployment status
+      run: |
+        echo "✅ Deployment successful!"
+        echo "🌐 Service URL: http://${{ steps.get-ip.outputs.public_ip }}"
+        echo "📊 Health Check: http://${{ steps.get-ip.outputs.public_ip }}/health"
+        
+    - name: Create deployment summary
+      run: |
+        cat > deployment-summary.md << EOF
+        # Deployment Summary
+        
+        **Status**: ✅ Success
+        **Timestamp**: $(date -u)
+        **Commit**: ${{ github.sha }}
+        **Branch**: ${{ github.ref_name }}
+        **Environment**: ${{ github.event.inputs.environment || 'production' }}
+        
+        ## Service Information
+        - **URL**: http://${{ steps.get-ip.outputs.public_ip }}
+        - **Health Check**: http://${{ steps.get-ip.outputs.public_ip }}/health
+        - **Instance ID**: ${{ env.EC2_INSTANCE_ID }}
+        - **Region**: ${{ env.AWS_REGION }}
+        
+        ## Deployment Details
+        - **Workflow**: ${{ github.workflow }}
+        - **Run ID**: ${{ github.run_id }}
+        - **Actor**: ${{ github.actor }}
+        EOF
+        
+    - name: Upload deployment summary
+      uses: actions/upload-artifact@v3
+      with:
+        name: deployment-summary
+        path: deployment-summary.md
+
+  # Job 4: Notify on failure
+  notify-failure:
+    name: Notify on Failure
+    runs-on: ubuntu-latest
+    needs: [test-and-build, security-scan, deploy]
+    if: failure()
+    
+    steps:
+    - name: Create failure notification
+      run: |
+        echo "❌ Deployment failed!"
+        echo "Check the workflow logs for details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

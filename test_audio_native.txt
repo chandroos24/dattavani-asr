@@ -1,0 +1,1 @@
+This is a demonstration transcription using the native Rust implementation. The audio appears to be quiet or low quality. Using base model for balanced performance.

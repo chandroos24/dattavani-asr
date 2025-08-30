@@ -5,7 +5,7 @@ Provides CLI commands for single file and batch processing of audio and video fi
 */
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{info, error, warn};
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -14,6 +14,9 @@ use crate::error::{DattavaniError, Result};
 use crate::asr::DattavaniAsr;
 use crate::streaming::StreamingProcessor;
 use crate::video::VideoProcessor;
+
+pub mod models;
+pub use models::{ModelsArgs, handle_models_command};
 
 #[derive(Parser)]
 #[command(name = "dattavani-asr")]
@@ -33,6 +36,42 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Simple transcription without complex model management
+    SimpleTranscribe {
+        /// Input audio file path
+        input: String,
+        
+        /// Language code (e.g., en, es, fr, hi)
+        #[arg(short, long)]
+        language: Option<String>,
+        
+        /// Whisper model to use (base, small, medium, large)
+        #[arg(short, long, default_value = "base")]
+        model: String,
+    },
+    
+    /// Native Rust transcription using Candle framework (Phase 2)
+    NativeTranscribe {
+        /// Input audio file path
+        input: String,
+        
+        /// Model ID from HuggingFace Hub
+        #[arg(short, long, default_value = "openai/whisper-base")]
+        model_id: String,
+        
+        /// Language code (e.g., en, es, fr, hi)
+        #[arg(short, long)]
+        language: Option<String>,
+        
+        /// Use FP16 precision for faster inference
+        #[arg(long, default_value = "true")]
+        fp16: bool,
+        
+        /// Temperature for sampling (0.0 = greedy)
+        #[arg(long, default_value = "0.0")]
+        temperature: f32,
+    },
+    
     /// Process a single audio or video file via streaming
     StreamProcess {
         /// Input file URI (gs://, https://drive.google.com/, or local path)
@@ -49,6 +88,32 @@ pub enum Commands {
         /// Segment duration for large files (seconds)
         #[arg(long, default_value = "300")]
         segment_duration: u64,
+    },
+    
+    /// Capture video segment with start/end time and process ASR
+    CaptureAndProcess {
+        /// Input video file URI (gs://, https://drive.google.com/, or local path)
+        input: String,
+        
+        /// Start time in HH:MM:SS format
+        #[arg(long)]
+        start_time: String,
+        
+        /// End time in HH:MM:SS format  
+        #[arg(long)]
+        end_time: String,
+        
+        /// Video title for output filename
+        #[arg(long)]
+        title: String,
+        
+        /// Language code (e.g., en, es, fr, hi)
+        #[arg(short, long)]
+        language: Option<String>,
+        
+        /// Output folder (optional, defaults to /Volumes/ssd1/video-capture on macOS)
+        #[arg(long)]
+        output_folder: Option<String>,
     },
     
     /// Process multiple files in a folder via streaming
@@ -94,6 +159,9 @@ pub enum Commands {
         #[arg(short, long, default_value = "dattavani-asr.toml")]
         output: PathBuf,
     },
+    
+    /// Manage ASR models
+    Models(ModelsArgs),
 }
 
 impl Cli {
@@ -106,13 +174,42 @@ impl Cli {
         }
         
         match cli.command {
+            Commands::SimpleTranscribe { 
+                input, 
+                language, 
+                model 
+            } => {
+                Self::simple_transcribe(input, language, model).await
+            }
+            
+            Commands::NativeTranscribe {
+                input,
+                model_id,
+                language,
+                fp16,
+                temperature,
+            } => {
+                Self::native_transcribe(input, model_id, language, fp16, temperature).await
+            }
+            
             Commands::StreamProcess { 
                 input, 
                 output, 
                 language, 
                 segment_duration 
             } => {
-                Self::stream_process_single(config, input, output, language, segment_duration).await
+                Self::process_stream(config, input, output, language, segment_duration).await
+            }
+            
+            Commands::CaptureAndProcess {
+                input,
+                start_time,
+                end_time,
+                title,
+                language,
+                output_folder,
+            } => {
+                Self::capture_and_process(config, input, start_time, end_time, title, language, output_folder).await
             }
             
             Commands::StreamBatch { 
@@ -144,10 +241,178 @@ impl Cli {
             Commands::GenerateConfig { output } => {
                 Self::generate_config(config, output).await
             }
+            
+            Commands::Models(models_args) => {
+                handle_models_command(models_args, config).await
+            }
         }
     }
     
-    async fn stream_process_single(
+    async fn simple_transcribe(
+        input: String,
+        language: Option<String>,
+        model: String,
+    ) -> Result<()> {
+        use crate::asr::simple::{SimpleTranscriber, SimpleTranscriptionOptions};
+        use std::path::Path;
+        
+        info!("🎤 Starting simple transcription");
+        info!("📁 Input: {}", input);
+        info!("🌍 Language: {:?}", language);
+        info!("🤖 Model: {}", model);
+        
+        let input_path = Path::new(&input);
+        
+        if !input_path.exists() {
+            error!("❌ Input file does not exist: {}", input);
+            return Err(DattavaniError::validation("Input file not found"));
+        }
+        
+        let transcriber = SimpleTranscriber::new().await?;
+        
+        let options = SimpleTranscriptionOptions {
+            model,
+            language,
+            timeout_seconds: 300, // 5 minutes
+            output_format: "txt".to_string(),
+            verbose: false,
+        };
+        
+        let progress = ProgressBar::new_spinner();
+        progress.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} [{elapsed_precise}] {msg}")
+                .unwrap()
+        );
+        progress.set_message("Transcribing audio...");
+        
+        match transcriber.transcribe(input_path, Some(options)).await {
+            Ok(result) => {
+                progress.finish_with_message("Transcription completed!");
+                
+                if result.success {
+                    println!("✅ Transcription completed!");
+                    if let Some(text) = &result.text {
+                        println!("📝 Text: {}", text);
+                        
+                        // Save to file
+                        let output_file = format!("{}.txt", 
+                            input_path.file_stem().unwrap().to_str().unwrap());
+                        tokio::fs::write(&output_file, text).await?;
+                        info!("💾 Saved to: {}", output_file);
+                    }
+                    
+                    if let Some(processing_time) = result.processing_time {
+                        info!("⏱️  Processing time: {:.2}s", processing_time);
+                    }
+                    info!("🤖 Model used: {}", result.model_used);
+                } else {
+                    error!("❌ Transcription failed: {}", result.error.as_deref().unwrap_or("Unknown error"));
+                    return Err(DattavaniError::asr_processing(result.error.unwrap_or_default()));
+                }
+                
+                Ok(())
+            }
+            Err(e) => {
+                progress.finish_with_message("Transcription failed!");
+                error!("❌ Transcription failed: {}", e);
+                Err(e)
+            }
+        }
+    }
+    
+    async fn native_transcribe(
+        input: String,
+        model_id: String,
+        language: Option<String>,
+        fp16: bool,
+        temperature: f32,
+    ) -> Result<()> {
+        #[cfg(feature = "native")]
+        {
+            use crate::asr::native::{NativeTranscriber, NativeTranscriptionOptions, TranscriptionTask};
+            use std::path::Path;
+            
+            info!("🚀 Starting native transcription (Phase 2)");
+            info!("📁 Input: {}", input);
+            info!("🤖 Model: {}", model_id);
+            info!("🌍 Language: {:?}", language);
+            info!("⚡ FP16: {}", fp16);
+            info!("🌡️ Temperature: {}", temperature);
+            
+            let input_path = Path::new(&input);
+            
+            if !input_path.exists() {
+                error!("❌ Input file does not exist: {}", input);
+                return Err(DattavaniError::validation("Input file not found"));
+            }
+            
+            let progress = ProgressBar::new_spinner();
+            progress.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{spinner:.green} [{elapsed_precise}] {msg}")
+                    .unwrap()
+            );
+            progress.set_message("Initializing native transcriber...");
+            
+            let mut transcriber = NativeTranscriber::new().await?;
+            
+            let options = NativeTranscriptionOptions {
+                model_id: model_id.clone(),
+                language: language.clone(),
+                task: TranscriptionTask::Transcribe,
+                temperature,
+                fp16,
+                ..Default::default()
+            };
+            
+            progress.set_message("Loading model and transcribing...");
+            
+            match transcriber.transcribe(input_path, options).await {
+                Ok(result) => {
+                    progress.finish_with_message("Native transcription completed!");
+                    
+                    println!("✅ Native transcription completed!");
+                    println!("📝 Text: {}", result.text);
+                    
+                    // Save to file
+                    let output_file = format!("{}_native.txt", 
+                        input_path.file_stem().unwrap().to_str().unwrap());
+                    tokio::fs::write(&output_file, &result.text).await?;
+                    info!("💾 Saved to: {}", output_file);
+                    
+                    info!("⏱️  Processing time: {:.2}s", result.processing_time);
+                    info!("🤖 Model used: {}", result.model_used);
+                    
+                    if let Some(confidence) = result.confidence {
+                        info!("🎯 Confidence: {:.2}%", confidence * 100.0);
+                    }
+                    
+                    if let Some(lang) = result.language {
+                        info!("🌍 Language: {}", lang);
+                    }
+                    
+                    Ok(())
+                }
+                Err(e) => {
+                    progress.finish_with_message("Native transcription failed!");
+                    error!("❌ Native transcription failed: {}", e);
+                    Err(e)
+                }
+            }
+        }
+        
+        #[cfg(not(feature = "native"))]
+        {
+            let _ = (input, model_id, language, fp16, temperature);
+            error!("❌ Native transcription not available. Enable 'native' feature or use simple-transcribe.");
+            Err(DattavaniError::configuration(
+                "Native implementation not available. Use 'simple-transcribe' command instead."
+            ))
+        }
+    }
+    
+    async fn process_stream(
         config: Config,
         input: String,
         output: Option<String>,
@@ -363,6 +628,221 @@ impl Cli {
         
         info!("✅ Configuration file generated successfully!");
         info!("💡 Edit the file to customize your settings, then set CONFIG_FILE environment variable");
+        
+        Ok(())
+    }
+    
+    async fn capture_and_process(
+        config: Config,
+        input: String,
+        start_time: String,
+        end_time: String,
+        title: String,
+        language: Option<String>,
+        output_folder: Option<String>,
+    ) -> Result<()> {
+        use chrono::{DateTime, Utc};
+        use std::path::Path;
+        
+        info!("🎬 Starting video capture and ASR processing");
+        info!("📁 Input: {}", input);
+        info!("⏰ Start time: {}", start_time);
+        info!("⏰ End time: {}", end_time);
+        info!("📝 Title: {}", title);
+        
+        // Validate time format
+        if !Self::validate_time_format(&start_time) || !Self::validate_time_format(&end_time) {
+            return Err(DattavaniError::validation("Invalid time format. Use HH:MM:SS"));
+        }
+        
+        // Set default output folder for macOS
+        let base_folder = output_folder.unwrap_or_else(|| "/Volumes/ssd1/video-capture".to_string());
+        
+        // Create timestamp for folder name
+        let now: DateTime<Utc> = Utc::now();
+        let timestamp = now.format("%Y%m%d_%H%M%S").to_string();
+        let folder_name = format!("{}-{}", title, timestamp);
+        let output_dir = Path::new(&base_folder).join(&folder_name);
+        
+        // Create output directory
+        tokio::fs::create_dir_all(&output_dir).await
+            .map_err(|e| DattavaniError::file_io(e))?;
+        
+        info!("📁 Created output directory: {}", output_dir.display());
+        
+        let progress = ProgressBar::new_spinner();
+        progress.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} [{elapsed_precise}] {msg}")
+                .unwrap()
+        );
+        
+        // Step 1: Capture video segment
+        progress.set_message("Capturing video segment...");
+        let video_filename = format!("{}-{}.mp4", title, timestamp);
+        let video_path = output_dir.join(&video_filename);
+        
+        Self::capture_video_segment(&input, &start_time, &end_time, &video_path).await?;
+        info!("✅ Video captured: {}", video_path.display());
+        
+        // Step 2: Extract audio as MP3
+        progress.set_message("Extracting audio...");
+        let audio_filename = format!("{}-{}.mp3", title, timestamp);
+        let audio_path = output_dir.join(&audio_filename);
+        
+        Self::extract_audio_as_mp3(&video_path, &audio_path).await?;
+        info!("✅ Audio extracted: {}", audio_path.display());
+        
+        // Step 3: Perform ASR
+        progress.set_message("Performing speech recognition...");
+        let asr = DattavaniAsr::new(config.clone()).await?;
+        
+        let transcript_path = output_dir.join(format!("{}-{}.txt", title, timestamp));
+        let result = asr.stream_process_single_file(
+            audio_path.to_str().unwrap(),
+            Some(transcript_path.to_str().unwrap()),
+            language.as_deref(),
+            None,
+        ).await?;
+        
+        progress.finish_with_message("Processing complete!");
+        
+        if result.success {
+            info!("✅ ASR processing successful!");
+            info!("📝 Transcript saved: {}", transcript_path.display());
+            if let Some(text) = &result.text {
+                info!("📄 Preview: {}", &text[..text.len().min(200)]);
+            }
+            info!("⏱️  Processing time: {:.2}s", result.processing_time.unwrap_or(0.0));
+            if let Some(confidence) = result.confidence {
+                info!("🎯 Confidence: {:.2}%", confidence * 100.0);
+            }
+        } else {
+            error!("❌ ASR processing failed: {}", result.error.as_deref().unwrap_or("Unknown error"));
+            return Err(DattavaniError::asr_processing(result.error.unwrap_or_default()));
+        }
+        
+        info!("🎉 All files saved in: {}", output_dir.display());
+        Ok(())
+    }
+    
+    fn validate_time_format(time_str: &str) -> bool {
+        let parts: Vec<&str> = time_str.split(':').collect();
+        if parts.len() != 3 {
+            return false;
+        }
+        
+        for part in &parts {
+            if part.parse::<u32>().is_err() {
+                return false;
+            }
+        }
+        
+        let hours: u32 = parts[0].parse().unwrap_or(25);
+        let minutes: u32 = parts[1].parse().unwrap_or(61);
+        let seconds: u32 = parts[2].parse().unwrap_or(61);
+        
+        hours < 24 && minutes < 60 && seconds < 60
+    }
+    
+    async fn capture_video_segment(
+        input: &str,
+        start_time: &str,
+        end_time: &str,
+        output_path: &Path,
+    ) -> Result<()> {
+        use tokio::process::Command;
+        
+        // Check if input is a YouTube URL
+        if input.contains("youtube.com") || input.contains("youtu.be") {
+            // For YouTube, use yt-dlp to stream directly to ffmpeg
+            let mut cmd = Command::new("yt-dlp");
+            cmd.args([
+                "--quiet",
+                "--no-warnings",
+                "-f", "best[ext=mp4]",
+                "--get-url",
+                input,
+            ]);
+            
+            let output = cmd.output().await
+                .map_err(|e| DattavaniError::ffmpeg(format!("yt-dlp execution failed: {}", e)))?;
+            
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(DattavaniError::ffmpeg(format!("yt-dlp failed: {}", stderr)));
+            }
+            
+            let stream_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            
+            // Now use ffmpeg with the stream URL
+            let mut ffmpeg_cmd = Command::new("ffmpeg");
+            ffmpeg_cmd.args([
+                "-i", &stream_url,
+                "-ss", start_time,
+                "-to", end_time,
+                "-c", "copy",
+                "-avoid_negative_ts", "make_zero",
+                "-y",
+                output_path.to_str().unwrap(),
+            ]);
+            
+            let ffmpeg_output = ffmpeg_cmd.output().await
+                .map_err(|e| DattavaniError::ffmpeg(format!("FFmpeg execution failed: {}", e)))?;
+            
+            if !ffmpeg_output.status.success() {
+                let stderr = String::from_utf8_lossy(&ffmpeg_output.stderr);
+                return Err(DattavaniError::ffmpeg(format!("FFmpeg failed: {}", stderr)));
+            }
+        } else {
+            // Original logic for local files and other URLs
+            let mut cmd = Command::new("ffmpeg");
+            cmd.args([
+                "-i", input,
+                "-ss", start_time,
+                "-to", end_time,
+                "-c", "copy",
+                "-avoid_negative_ts", "make_zero",
+                "-y",
+                output_path.to_str().unwrap(),
+            ]);
+            
+            let output = cmd.output().await
+                .map_err(|e| DattavaniError::ffmpeg(format!("FFmpeg execution failed: {}", e)))?;
+            
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(DattavaniError::ffmpeg(format!("FFmpeg failed: {}", stderr)));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    async fn extract_audio_as_mp3(
+        video_path: &Path,
+        audio_path: &Path,
+    ) -> Result<()> {
+        use tokio::process::Command;
+        
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
+            "-i", video_path.to_str().unwrap(),
+            "-vn", // No video
+            "-acodec", "mp3",
+            "-ab", "192k", // Audio bitrate
+            "-ar", "44100", // Sample rate
+            "-y", // Overwrite output file
+            audio_path.to_str().unwrap(),
+        ]);
+        
+        let output = cmd.output().await
+            .map_err(|e| DattavaniError::ffmpeg(format!("FFmpeg execution failed: {}", e)))?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(DattavaniError::ffmpeg(format!("FFmpeg failed: {}", stderr)));
+        }
         
         Ok(())
     }

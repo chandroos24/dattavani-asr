@@ -1,0 +1,12 @@
+{
+  "d_model": 512,
+  "decoder_attention_heads": 8,
+  "decoder_layers": 6,
+  "demo_mode": true,
+  "encoder_attention_heads": 8,
+  "encoder_layers": 6,
+  "max_position_embeddings": 448,
+  "model_id": "openai/whisper-base",
+  "model_type": "whisper",
+  "vocab_size": 51865
+}

@@ -1,0 +1,144 @@
+version: '3.8'
+
+services:
+  dattavani-asr:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: dattavani-asr-rust
+    restart: unless-stopped
+    ports:
+      - "7860:7860"
+      - "8080:8080"
+    environment:
+      - RUST_LOG=info
+      - AWS_REGION=us-east-1
+      - S3_BUCKET=dattavani
+      - WHISPER_MODEL_SIZE=large-v3
+      - MAX_WORKERS=2
+      - TEMP_DIR=/tmp/dattavani_asr
+      - CACHE_DIR=/app/.cache/dattavani-asr
+      - CONFIG_PATH=/app/config/dattavani-asr.toml
+    volumes:
+      - ./config:/app/config:ro
+      - dattavani_logs:/app/logs
+      - dattavani_cache:/app/.cache/dattavani-asr
+      - dattavani_temp:/tmp/dattavani_asr
+      - ~/.aws:/root/.aws:ro  # AWS credentials
+    networks:
+      - dattavani-network
+    healthcheck:
+      test: ["CMD", "dattavani-asr", "health-check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 4G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  nginx:
+    image: nginx:alpine
+    container_name: dattavani-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - dattavani_logs:/var/log/nginx
+    depends_on:
+      - dattavani-asr
+    networks:
+      - dattavani-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: Redis for caching (if needed in future)
+  redis:
+    image: redis:7-alpine
+    container_name: dattavani-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - dattavani_redis:/data
+    networks:
+      - dattavani-network
+    command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy allkeys-lru
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: Monitoring with Prometheus (if needed)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: dattavani-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - dattavani_prometheus:/prometheus
+    networks:
+      - dattavani-network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    profiles:
+      - monitoring
+
+  # Optional: Grafana for visualization (if needed)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: dattavani-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+    volumes:
+      - dattavani_grafana:/var/lib/grafana
+    networks:
+      - dattavani-network
+    profiles:
+      - monitoring
+
+volumes:
+  dattavani_logs:
+    driver: local
+  dattavani_cache:
+    driver: local
+  dattavani_temp:
+    driver: local
+  dattavani_redis:
+    driver: local
+  dattavani_prometheus:
+    driver: local
+  dattavani_grafana:
+    driver: local
+
+networks:
+  dattavani-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

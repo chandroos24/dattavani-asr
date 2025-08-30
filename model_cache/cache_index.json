@@ -1,0 +1,10 @@
+{
+  "openai/whisper-base": {
+    "model_id": "openai/whisper-base",
+    "cache_path": "./model_cache/openai_whisper-base",
+    "size_bytes": 12847,
+    "created_at": "2025-08-27T01:30:40.163389Z",
+    "last_accessed": "2025-08-27T06:28:03.552210Z",
+    "version": "demo-1.0"
+  }
+}
